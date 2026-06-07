@@ -1,0 +1,55 @@
+name: Deploy FastAPI AI Server to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Copy FastAPI source to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "."
+          target: "/home/ec2-user/ai-server"
+          rm: true
+
+      - name: Create env file, install dependencies and restart AI server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ec2-user/ai-server
+
+            python3.11 -m venv venv
+            source venv/bin/activate
+
+            pip install --upgrade pip
+
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            else
+              pip install fastapi uvicorn python-dotenv openai requests beautifulsoup4 pymupdf pydantic
+            fi
+
+            cat > /home/ec2-user/ai-server/.env << 'EOF'
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
+            EOF
+
+            chmod 600 /home/ec2-user/ai-server/.env
+
+            sudo systemctl daemon-reload
+            sudo systemctl restart ore-ai
+            sudo systemctl status ore-ai --no-pager -l
