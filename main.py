@@ -50,6 +50,31 @@ class ManualProcessResponse(BaseModel):
     customerCenter: str
 
 
+class ChatProductInfo(BaseModel):
+    productId: str
+    name: Optional[str] = ""
+    nickname: Optional[str] = ""
+    category: Optional[str] = ""
+
+
+class ChatHistoryItem(BaseModel):
+    role: Literal["USER", "ASSISTANT"]
+    content: str
+
+
+class AiChatRequest(BaseModel):
+    sessionId: str
+    message: str = Field(..., description="사용자 질문")
+    product: Optional[ChatProductInfo] = None
+    manualContent: Optional[str] = None
+    manualUrl: Optional[str] = None
+    history: list[ChatHistoryItem] = []
+
+
+class AiChatResponse(BaseModel):
+    answer: str
+
+
 # 서버 상태 확인용 health check API
 @app.get("/health")
 def health():
@@ -128,6 +153,31 @@ def process_product_manual(request: ManualProcessRequest):
         return JSONResponse(
             status_code=500,
             content={"message": "매뉴얼 검색 중 오류가 발생했습니다."}
+        )
+
+
+# 사용자 질문과 제품/매뉴얼 문맥을 기반으로 AI 답변을 생성하는 API
+@app.post("/ai/chat", response_model=AiChatResponse)
+def generate_ai_chat_answer(request: AiChatRequest):
+    # 질문 내용 검증
+    if not request.message or not request.message.strip():
+        return JSONResponse(
+            status_code=400,
+            content={"message": "질문을 이해할 수 없습니다."}
+        )
+
+    try:
+        answer = generate_chat_answer(request)
+
+        return AiChatResponse(
+            answer=answer
+        )
+
+    except Exception as e:
+        print("[ERROR] AI 채팅 응답 생성 실패:", e)
+        return JSONResponse(
+            status_code=500,
+            content={"message": "AI 응답 생성 중 오류가 발생했습니다."}
         )
 
 
@@ -974,3 +1024,145 @@ def retry_summarize_with_required_sections(
         customer_center=customer_center,
         error_label="재요약"
     )
+
+
+# 제품/매뉴얼/대화 이력을 기반으로 AI 채팅 답변 생성
+def generate_chat_answer(request: AiChatRequest) -> str:
+    prompt = build_chat_prompt(request)
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    )
+
+    return response.output_text.strip()
+
+
+# AI 채팅 답변 생성을 위한 프롬프트 구성
+def build_chat_prompt(request: AiChatRequest) -> str:
+    history_text = format_chat_history(request.history)
+
+    if request.product is None:
+        context = build_general_chat_context()
+    else:
+        context = build_product_chat_context(
+            product=request.product,
+            manual_content=request.manualContent or "",
+            manual_url=request.manualUrl or ""
+        )
+
+    prompt = f"""
+        너는 ORE 서비스의 제품 관리 AI 챗봇이야.
+
+        답변 규칙:
+        1. 한국어로 답변해.
+        2. 사용자가 이해하기 쉽게 짧고 명확하게 답변해.
+        3. 확실하지 않은 내용은 단정하지 마.
+        4. 제품 질문에서 manualContent가 제공된 경우, manualContent를 가장 우선하여 답변해.
+        5. manualContent에 없는 내용은 "제공된 매뉴얼 내용 기준으로는 확인되지 않지만"처럼 표현하고 일반적인 안내로 답변해.
+        6. manualUrl은 manualContent만으로 답변이 부족할 때 참고 가능한 원본 매뉴얼 위치로만 취급해.
+        7. 사용자가 위험한 분해, 임의 수리, 전기 작업을 요구하면 직접 수리 방법을 자세히 안내하지 말고 공식 서비스센터 문의를 권장해.
+        8. 답변에는 마크다운 표를 쓰지 마.
+        9. 너무 길게 설명하지 말고 3~6문장 정도로 답변해.
+
+        {context}
+
+        이전 대화:
+        {history_text}
+
+        사용자 질문:
+        {request.message}
+    """
+
+    return prompt.strip()
+
+
+# 제품 질문용 문맥 구성
+def build_product_chat_context(
+    product: ChatProductInfo,
+    manual_content: str,
+    manual_url: str
+) -> str:
+    product_display_name = product.nickname or product.name or "선택한 제품"
+
+    context = f"""
+        현재 사용자는 특정 제품에 대해 질문하고 있어.
+
+        제품 정보:
+        - 제품 ID: {product.productId}
+        - 제품명: {product.name}
+        - 제품 별명: {product.nickname}
+        - 카테고리: {product.category}
+        - 화면 표시용 제품명: {product_display_name}
+    """
+
+    if manual_content.strip():
+        context += f"""
+
+            아래 내용은 사용자가 확인/수정/확정한 최종 매뉴얼 내용이야.
+            AI 답변은 반드시 이 내용을 가장 우선 근거로 삼아야 해.
+
+            manualContent:
+            {manual_content[:12000]}
+        """
+    else:
+        context += """
+
+            manualContent가 제공되지 않았어.
+            이 경우 제품 정보와 일반적인 제품 관리 지식만 바탕으로 답변하되, 단정하지 마.
+        """
+
+    if manual_url.strip():
+        context += f"""
+
+            manualUrl:
+            {manual_url}
+
+            manualUrl은 원본 매뉴얼 위치야.
+            현재 답변에서는 manualContent를 우선하고, manualContent만으로 부족한 경우 manualUrl이 참고 자료로 존재한다고 판단해.
+            단, 실제로 manualUrl 내용을 읽지 못했다면 manualUrl에 있는 내용을 본 것처럼 말하지 마.
+        """
+
+    return context.strip()
+
+
+# 기타 질문용 문맥 구성
+def build_general_chat_context() -> str:
+    return """
+            현재 사용자는 특정 제품을 선택하지 않은 기타 질문을 하고 있어.
+
+            답변 범위:
+            - ORE 서비스 사용 방법
+            - 제품 등록, 매뉴얼 확인, 수리 이력 관리, 수리 예정 알림 등 서비스 관련 안내
+            - 일반적인 제품 관리 질문
+
+            특정 제품 매뉴얼이 필요한 질문이면, 제품을 선택한 뒤 다시 질문하도록 자연스럽게 안내해.
+        """.strip()
+
+
+# 이전 대화 이력을 프롬프트에 넣기 좋은 형태로 변환
+def format_chat_history(history: list[ChatHistoryItem]) -> str:
+    if not history:
+        return "이전 대화 없음"
+
+    formatted_messages = []
+
+    # 너무 긴 대화는 최근 10개만 사용
+    recent_history = history[-10:]
+
+    for item in recent_history:
+        role = "사용자" if item.role == "USER" else "AI"
+        content = item.content.strip()
+
+        if content:
+            formatted_messages.append(f"{role}: {content}")
+
+    if not formatted_messages:
+        return "이전 대화 없음"
+
+    return "\n".join(formatted_messages)
